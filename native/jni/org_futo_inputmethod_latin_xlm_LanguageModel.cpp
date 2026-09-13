@@ -8,6 +8,7 @@
 #include "jni.h"
 #include "jni_common.h"
 #include "ggml/LanguageModel.h"
+#include "ggml/keyboardlm_text.h"
 #include "defines.h"
 #include "suggest/core/layout/proximity_info.h"
 #include "jni_utils.h"
@@ -128,44 +129,8 @@ enum WordCapitalizeMode {
     AllCapitals      // partialWord = "TE" or partialWord = "TEST"
 };
 
-bool isLowercase(unsigned char c, bool strict) {
-    if(strict) {
-        return islower(c);
-    } else {
-        return isupper(c) == 0;
-    }
-}
-
-bool isFirstCharLowercase(const char* str, bool strict) {
-    if (str == nullptr || str[0] == '\0')
-        return false;
-    return isLowercase(static_cast<unsigned char>(str[0]), strict);
-}
-
-
-bool hasLowercase(const char* str, bool strict) {
-    if (str == nullptr)
-        return false;
-
-    for (; *str != '\0'; ++str) {
-        if (isLowercase(static_cast<unsigned char>(*str), strict))
-            return true;
-    }
-    return false;
-}
-
 bool isExactMatch(const std::string &a, const std::string &b){
-    auto preprocess = [](const std::string &str) -> std::string {
-        std::string result;
-        for(char c : str) {
-            if(c != '\'' && c != '-' && c != ' ') {
-                result += (char)tolower(c);
-            }
-        }
-        return result;
-    };
-
-    return preprocess(a) == preprocess(b);
+    return kblm::normalize_for_match(a) == kblm::normalize_for_match(b);
 }
 
 bool isTokenMixRoughlyEqual(const TokenMix &a, const TokenMix &b) {
@@ -191,14 +156,15 @@ struct LanguageModelState {
         int DASH = 0;
         int STAR = 0;
 
-        int LETTERS_TO_IDS[26] = { 0 };
-
         std::vector<int> banned_start_of_word_tokens;
         std::vector<int> banned_tokens_for_first_capital;
         std::vector<int> banned_tokens_for_all_capitals;
         std::vector<int> banned_tokens_word_separators; // probabilities add to space token
         std::vector<int> general_banned_tokens;
     } specialTokens;
+
+    kblm::LetterTokenMap letters;   // to_lower(код-поинт) -> id токена <CHAR_x>, из словаря модели
+    bool bug_hacks = true;          // хаки детекции бага в Sample(); off для моделей с фичей opt_no_bug_hacks
 
     bool Initialize(const std::string &paths){
         model = std::unique_ptr<LanguageModel>(LlamaAdapter::createLanguageModel(paths));
@@ -217,16 +183,14 @@ struct LanguageModelState {
             specialTokens.XBC = model->tokenToId("<XBC>");
             specialTokens.XEC = model->tokenToId("<XEC>");
 
-            specialTokens.LETTERS_TO_IDS[0] = model->tokenToId("<CHAR_A>");
+            letters = kblm::LetterTokenMap::from_vocab(model->getVocabSize(), [&](int i) {
+                return std::string(model->getToken(i));
+            });
 
             ASSERT(specialTokens.XBU != 0);
             ASSERT(specialTokens.XBC != 0);
             ASSERT(specialTokens.XEC != 0);
-            ASSERT(specialTokens.LETTERS_TO_IDS[0] != 0);
-
-            for(int i = 1; i < 26; i++) {
-                specialTokens.LETTERS_TO_IDS[i] = specialTokens.LETTERS_TO_IDS[0] + i;
-            }
+            ASSERT(!letters.empty());
 
             if(model->adapter->hasFeature(FEATURE_SWIPE_TYPING)) {
                 specialTokens.XC0_SWIPE_MODE = model->tokenToId("<XC0>");
@@ -237,6 +201,8 @@ struct LanguageModelState {
             specialTokens.XBC = -1;
             specialTokens.XEC = -1;
         }
+
+        bug_hacks = !model->adapter->hasFeature("opt_no_bug_hacks");
 
         specialTokens.banned_tokens_word_separators = { };
         specialTokens.general_banned_tokens = { model->tokenToId("-▁") };
@@ -265,10 +231,10 @@ struct LanguageModelState {
         size_t n_vocab = llama_n_vocab(model->model());
         for(int i=0; i < (int)n_vocab; i++) {
             const char *text = model->adapter->getToken(i);
-            if(isFirstCharLowercase(text, true)) {
+            if(kblm::first_is_lower(text)) {
                 specialTokens.banned_tokens_for_first_capital.push_back(i);
                 specialTokens.banned_tokens_for_all_capitals.push_back(i);
-            }else if(hasLowercase(text, true)){
+            } else if(kblm::has_lower(text)) {
                 specialTokens.banned_tokens_for_all_capitals.push_back(i);
             }
 
@@ -585,7 +551,7 @@ struct LanguageModelState {
 
         // TODO: This should really not be here
         is_bugged = is_bugged && logits[561] < -990.0f && logits[561] > -1100.0f;
-        if(is_bugged) {
+        if(bug_hacks && is_bugged) {
             AKLOGE("Detected bug!!!! Trying to mitigate. Let's just reset cache and exit");
             llama_kv_cache_seq_rm(ctx, -1, -1, -1);
             model->transformerContext.active_context = { };
@@ -629,7 +595,7 @@ struct LanguageModelState {
                 break;
             }
         }
-        if(is_bugged) {
+        if(bug_hacks && is_bugged) {
             AKLOGE("Detected bug2!!!! Trying to mitigate. Let's just reset cache and exit");
             llama_kv_cache_seq_rm(ctx, -1, -1, -1);
             model->transformerContext.active_context = { };
@@ -1019,16 +985,14 @@ namespace latinime {
             partialWordString = jstring2string(env, partialWord);
         }
 
-        if(partialWordString.size() < inputSize) inputSize = partialWordString.size();
+        const std::vector<int> partialCps = kblm::utf8_codepoints(partialWordString);
+        if(partialCps.size() < inputSize) inputSize = partialCps.size();
 
         WordCapitalizeMode capitals = WordCapitalizeMode::IgnoredCapitals;
 
-        if(!partialWordString.empty() && !isFirstCharLowercase(partialWordString.c_str(), false)) {
-            if(partialWordString.size() > 1 && !hasLowercase(partialWordString.c_str(), false)) {
-                capitals = WordCapitalizeMode::AllCapitals;
-            } else {
-                capitals = WordCapitalizeMode::FirstCapital;
-            }
+        if(!partialCps.empty() && kblm::is_upper(partialCps[0])) {
+            capitals = (partialCps.size() > 1 && kblm::all_upper(partialCps))
+                    ? WordCapitalizeMode::AllCapitals : WordCapitalizeMode::FirstCapital;
         }
 
         std::vector<std::string> bannedWords;
@@ -1052,8 +1016,9 @@ namespace latinime {
         std::vector<TokenMix> mixes;
         int numSkippedDueToNoCoordinate = 0;
         for(size_t i=0; i<inputSize; i++) {
-            char wc = partialWordString[i];
-            if (!(wc >= 'a' && wc <= 'z') && !(wc >= 'A' && wc <= 'Z') && !(wc >= '0' && wc <= '9')) {
+            const int wc = partialCps[i];
+            const bool isDigit = (wc >= '0' && wc <= '9');
+            if (state->letters.find(wc) < 0 && !isDigit) {
                 //AKLOGI("%d | Char %c skipped due to not within range", i, wc);
                 continue;
             }
@@ -1064,7 +1029,7 @@ namespace latinime {
             }
 
             int tapY = yCoordinates[i];
-            if(wc >= '0' && wc <= '9') {
+            if(isDigit) {
                 // If this is a number key, move the tap a little down
                 // to find the key below when typing with number row active
                 tapY += pInfo->getMostCommonKeyWidth() * 2 / 3;
@@ -1090,11 +1055,9 @@ namespace latinime {
             for(int s=0; s<4; s++) {
                 num_symbols = 0;
                 for (int j = 0; j < NUM_TOKEN_MIX; j++) {
-                    char c = (char) (pInfo->getKeyCodePoint(index_value[j].second));
+                    const int c = pInfo->getKeyCodePoint(index_value[j].second);
 
-                    if (c >= 'a' && c <= 'z') {
-                    } else if (c >= 'A' && c <= 'Z') {
-                    } else if(index_value[j].first > 0.0f) {
+                    if (state->letters.find(c) < 0 && index_value[j].first > 0.0f) {
                         index_value[j].first = 0.0f;
                         needs_resorting = true;
                         num_symbols++;
@@ -1136,16 +1099,15 @@ namespace latinime {
 
 
             for(int j=0; j<NUM_TOKEN_MIX; j++) {
-                char c = (char) (pInfo->getKeyCodePoint(index_value[j].second));
-                float w = index_value[j].first;
+                const int c = pInfo->getKeyCodePoint(index_value[j].second);
+                const int id = state->letters.find(c);
 
-                results.mixes[j].weight = w;
-                if(c >= 'a' && c <= 'z') {
-                    results.mixes[j].token = (state->specialTokens.LETTERS_TO_IDS[c - 'a']);
-                }else if(c >= 'A' && c <= 'Z') {
-                    results.mixes[j].token = (state->specialTokens.LETTERS_TO_IDS[c - 'A']);
+                results.mixes[j].weight = index_value[j].first;
+                if(id >= 0) {
+                    results.mixes[j].token = id;
                 } else {
-                    //AKLOGI("ignoring character in partial word [%c]", c);
+                    //AKLOGI("ignoring character in partial word [%d]", c);
+                    results.mixes[j].token = 0;
                     results.mixes[j].weight = 0.0f;
                 }
             }
@@ -1156,11 +1118,8 @@ namespace latinime {
         if(mixes.empty() && numSkippedDueToNoCoordinate > 0) {
             AKLOGI("BUG: Mixes is empty due to lacking input coordinates. Falling back to non-mixing");
             for(size_t i=0; i<inputSize; i++) {
-                char wc = partialWordString[i];
-                if (!(wc >= 'a' && wc <= 'z') && !(wc >= 'A' && wc <= 'Z')) {
-                    continue;
-                }
-
+                const int id = state->letters.find(partialCps[i]);
+                if (id < 0) continue;
 
                 TokenMix results {};
                 results.x = -1.0f;
@@ -1168,12 +1127,7 @@ namespace latinime {
 
                 for(int j=0; j<NUM_TOKEN_MIX; j++) {
                     results.mixes[j].weight = 0.0f;
-
-                    if(wc >= 'a' && wc <= 'z') {
-                        results.mixes[j].token = (state->specialTokens.LETTERS_TO_IDS[wc - 'a']);
-                    }else if(wc >= 'A' && wc <= 'Z') {
-                        results.mixes[j].token = (state->specialTokens.LETTERS_TO_IDS[wc - 'A']);
-                    }
+                    results.mixes[j].token = id;
                 }
 
                 results.mixes[0].weight = 1.0f;
@@ -1241,7 +1195,8 @@ namespace latinime {
         }
 
         // No way it's correct if it's way shorter! (unless we're swipe typing)
-        if(!results.empty() && !partialWordString.empty() && (results[0].second.size() * 2 < partialWordString.size()) && inputMode != 1) {
+        if(!results.empty() && !partialWordString.empty()
+           && (kblm::utf8_codepoints(results[0].second).size() * 2 < partialCps.size()) && inputMode != 1) {
             result_probability_mode = RETURNVAL_CLUELESS;
         }
 
