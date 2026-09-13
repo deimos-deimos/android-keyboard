@@ -88,7 +88,35 @@ object QWERTYKeyboardLayout : KeyboardLayout {
 
 }
 
+// Координаты ЙЦУКЕН в той же системе, что QWERTY выше: ширина 1440, ряды y = 106/312/515,
+// 11 слотов в ряду (третий ряд из 9 букв центрирован: shift и delete по краям).
+object YCUKENKeyboardLayout : KeyboardLayout {
+    override val tapSize: Vector2 = Vector2(80.0f, 80.0f)
+
+    private val ROWS = listOf("йцукенгшщзх", "фывапролджэ", "ячсмитьбю")
+    private val ROW_Y = listOf(106.0f, 312.0f, 515.0f)
+    private const val SLOT = 1440.0f / 11.0f
+
+    private val KEYBOARD_KEYS: HashMap<Char, Vector2> = hashMapOf<Char, Vector2>().also { map ->
+        ROWS.forEachIndexed { r, row ->
+            val offset = (11 - row.length) / 2.0f
+            row.forEachIndexed { c, ch -> map[ch] = Vector2((offset + c + 0.5f) * SLOT, ROW_Y[r]) }
+        }
+        map[SHIFT_KEY] = Vector2(0.5f * SLOT, 515.0f)
+        map[BACKSPACE_KEY] = Vector2(10.5f * SLOT, 515.0f)
+    }
+
+    override fun getKeyPosition(character: Char): Vector2? = KEYBOARD_KEYS[character]
+
+    override fun getClosestKey(position: Vector2): Char =
+        KEYBOARD_KEYS.minBy { (it.value - position).magnitudeSquared() }.key
+}
+
 private object WordMisspelling {
+    private const val CYRILLIC = "абвгдежзийклмнопрстуфхцчшщъыьэюяё"
+    fun layoutFor(word: String): KeyboardLayout =
+        if (word.lowercase().any { it in CYRILLIC }) YCUKENKeyboardLayout else QWERTYKeyboardLayout
+
     fun substituteKeyboardLetters(layout: KeyboardLayout, word: String, temperature: Float = 0.6f): String {
         val keys = word.lowercase().toList()
         val newKeys = mutableListOf<Char>()
@@ -171,7 +199,7 @@ private object WordMisspelling {
         }
 
         // Substitute the word's characters with nearby ones randomly
-        misspelledWord = substituteKeyboardLetters(QWERTYKeyboardLayout, misspelledWord, temperature = 1.0f * getRand())
+        misspelledWord = substituteKeyboardLetters(layoutFor(word), misspelledWord, temperature = 1.0f * getRand())
 
         // Trim word randomly as if the user hasn't finished writing the word yet
         // This helps the model learn to complete partially-written words
@@ -214,6 +242,39 @@ private val TOKENIZER_LETTER_MAPPING = hashMapOf(
     'x' to "<CHAR_X>",
     'y' to "<CHAR_Y>",
     'z' to "<CHAR_Z>",
+    'а' to "<CHAR_а>",
+    'б' to "<CHAR_б>",
+    'в' to "<CHAR_в>",
+    'г' to "<CHAR_г>",
+    'д' to "<CHAR_д>",
+    'е' to "<CHAR_е>",
+    'ж' to "<CHAR_ж>",
+    'з' to "<CHAR_з>",
+    'и' to "<CHAR_и>",
+    'й' to "<CHAR_й>",
+    'к' to "<CHAR_к>",
+    'л' to "<CHAR_л>",
+    'м' to "<CHAR_м>",
+    'н' to "<CHAR_н>",
+    'о' to "<CHAR_о>",
+    'п' to "<CHAR_п>",
+    'р' to "<CHAR_р>",
+    'с' to "<CHAR_с>",
+    'т' to "<CHAR_т>",
+    'у' to "<CHAR_у>",
+    'ф' to "<CHAR_ф>",
+    'х' to "<CHAR_х>",
+    'ц' to "<CHAR_ц>",
+    'ч' to "<CHAR_ч>",
+    'ш' to "<CHAR_ш>",
+    'щ' to "<CHAR_щ>",
+    'ъ' to "<CHAR_ъ>",
+    'ы' to "<CHAR_ы>",
+    'ь' to "<CHAR_ь>",
+    'э' to "<CHAR_э>",
+    'ю' to "<CHAR_ю>",
+    'я' to "<CHAR_я>",
+    'ё' to "<CHAR_ё>",
 )
 
 private fun tokenizerFormatUserInput(misspelledWord: String): String {
@@ -248,7 +309,7 @@ object TrainingDataGenerator {
     }
 
 
-    private val permittedCharacters = "abcdefghijklmnopqrstuvwxyz'-".toHashSet()
+    private val permittedCharacters = "abcdefghijklmnopqrstuvwxyz'-".toHashSet() + "абвгдежзийклмнопрстуфхцчшщъыьэюяё".toHashSet()
     fun suitableToMisspell(word: String): Boolean {
         return permittedCharacters.containsAll(word.lowercase().toList())
     }
