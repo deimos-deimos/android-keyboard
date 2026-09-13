@@ -104,6 +104,13 @@ object YCUKENKeyboardLayout : KeyboardLayout {
         }
         map[SHIFT_KEY] = Vector2(0.5f * SLOT, 515.0f)
         map[BACKSPACE_KEY] = Vector2(10.5f * SLOT, 515.0f)
+
+        // ё and ъ have no key of their own on this layout (see east_slavic.yaml); FUTO's
+        // Russian layout reaches them as long-press aliases of е and ь respectively
+        // (TestsRussian.setAccentedLetters: setMoreKeysOf("е","ё"), setMoreKeysOf("ь","ъ")).
+        // Give them their base key's position so substituteKeyboardLetters doesn't drop them.
+        map['ё'] = map.getValue('е')
+        map['ъ'] = map.getValue('ь')
     }
 
     override fun getKeyPosition(character: Char): Vector2? = KEYBOARD_KEYS[character]
